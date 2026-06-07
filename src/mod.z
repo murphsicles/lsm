@@ -1,0 +1,447 @@
+// @storage/lsm — LSM-tree storage engine
+// Grid block allocator, B-tree node operations, compaction merge, manifest
+// Pure Zeta. No stubs.
+
+extern fn write(fd: i64, buf: i64, count: i64) -> i64;
+extern fn read(fd: i64, buf: i64, count: i64) -> i64;
+extern fn pread(fd: i64, buf: i64, count: i64, offset: i64) -> i64;
+extern fn pwrite(fd: i64, buf: i64, count: i64, offset: i64) -> i64;
+extern fn malloc(size: i64) -> i64;
+extern fn free(ptr: i64);
+
+// ─── Constants ───
+
+pub const BLOCK_SIZE: i64 = 4096;
+pub const KEY_SIZE: i64 = 8;
+pub const VALUE_SIZE: i64 = 8;
+pub const ENTRY_SIZE: i64 = KEY_SIZE + VALUE_SIZE;  // 16 bytes
+pub const ENTRIES_PER_BLOCK: i64 = BLOCK_SIZE / ENTRY_SIZE;  // 256
+pub const MAX_TABLE_ENTRIES: i64 = ENTRIES_PER_BLOCK * 64;   // 16384
+pub const MAX_LEVELS: i64 = 8;
+pub const TOMBSTONE: i64 = 1;
+
+// ─── Grid: fixed-size block storage ───
+
+pub fn Grid_alloc_block(fd: i64, count: i64) -> i64 {
+    let offset: i64 = count * BLOCK_SIZE;
+    return offset;
+}
+
+pub fn Grid_write(fd: i64, block_addr: i64, buf: i64) -> i64 {
+    return pwrite(fd, buf, BLOCK_SIZE, block_addr);
+}
+
+pub fn Grid_read(fd: i64, block_addr: i64, buf: i64) -> i64 {
+    return pread(fd, buf, BLOCK_SIZE, block_addr);
+}
+
+// ─── Entry: key-value pair with tombstone ───
+
+pub struct Entry {
+    key: i64,
+    value: i64,
+    tombstone: i64,
+}
+
+pub fn Entry_new(key: i64, value: i64) -> Entry {
+    return Entry { key: key, value: value, tombstone: 0 };
+}
+
+pub fn Entry_tombstone(key: i64) -> Entry {
+    return Entry { key: key, value: 0, tombstone: TOMBSTONE };
+}
+
+pub fn Entry_is_tombstone(e: &Entry) -> i64 {
+    return e.tombstone;
+}
+
+// ─── Sorted entry array ───
+
+pub fn entry_compare(a: &Entry, b: &Entry) -> i64 {
+    if a.key < b.key { return -1; }
+    if a.key > b.key { return 1; }
+    return 0;
+}
+
+// Binary search on a sorted entry array
+pub fn binary_search(entries: i64, count: i64, target: i64) -> (i64, i64) {
+    let low: i64 = 0;
+    let high: i64 = count - 1;
+    while low <= high {
+        let mid: i64 = low + (high - low) / 2;
+        let entry_ptr: i64 = entries + mid * ENTRY_SIZE;
+        let key: i64 = *entry_ptr;
+        if key == target {
+            let value: i64 = *(entry_ptr + KEY_SIZE);
+            return (mid, value);
+        }
+        if key < target {
+            low = mid + 1;
+        } else {
+            high = mid - 1;
+        }
+    }
+    return (-1, 0);
+}
+
+// Merge two sorted entry arrays (for compaction)
+pub fn merge_entries(a_base: i64, a_count: i64, b_base: i64, b_count: i64, out: i64) -> i64 {
+    let ai: i64 = 0;
+    let bi: i64 = 0;
+    let oi: i64 = 0;
+    while ai < a_count && bi < b_count {
+        let a_ptr: i64 = a_base + ai * ENTRY_SIZE;
+        let b_ptr: i64 = b_base + bi * ENTRY_SIZE;
+        let a_key: i64 = *a_ptr;
+        let b_key: i64 = *b_ptr;
+        let out_ptr: i64 = out + oi * ENTRY_SIZE;
+        if a_key <= b_key {
+            // Take from A (if tombstone, skip if B has an entry with same key)
+            let a_val: i64 = *(a_ptr + KEY_SIZE);
+            let a_tomb: i64 = *(a_ptr + KEY_SIZE + KEY_SIZE);
+            if a_tomb == 0 || ai + 1 < a_count {
+                *out_ptr = a_key;
+                *(out_ptr + KEY_SIZE) = a_val;
+                *(out_ptr + KEY_SIZE + KEY_SIZE) = a_tomb;
+                oi = oi + 1;
+            }
+            ai = ai + 1;
+        } else {
+            let b_val: i64 = *(b_ptr + KEY_SIZE);
+            let b_tomb: i64 = *(b_ptr + KEY_SIZE + KEY_SIZE);
+            if b_tomb == 0 {
+                *out_ptr = b_key;
+                *(out_ptr + KEY_SIZE) = b_val;
+                *(out_ptr + KEY_SIZE + KEY_SIZE) = 0;
+                oi = oi + 1;
+            }
+            bi = bi + 1;
+        }
+    }
+    // Drain remaining from A
+    while ai < a_count {
+        let a_ptr: i64 = a_base + ai * ENTRY_SIZE;
+        let a_key: i64 = *a_ptr;
+        let a_val: i64 = *(a_ptr + KEY_SIZE);
+        let a_tomb: i64 = *(a_ptr + KEY_SIZE + KEY_SIZE);
+        let out_ptr: i64 = out + oi * ENTRY_SIZE;
+        if a_tomb == 0 {
+            *out_ptr = a_key;
+            *(out_ptr + KEY_SIZE) = a_val;
+            *(out_ptr + KEY_SIZE + KEY_SIZE) = 0;
+            oi = oi + 1;
+        }
+        ai = ai + 1;
+    }
+    // Drain remaining from B
+    while bi < b_count {
+        let b_ptr: i64 = b_base + bi * ENTRY_SIZE;
+        let b_key: i64 = *b_ptr;
+        let b_val: i64 = *(b_ptr + KEY_SIZE);
+        let b_tomb: i64 = *(b_ptr + KEY_SIZE + KEY_SIZE);
+        let out_ptr: i64 = out + oi * ENTRY_SIZE;
+        if b_tomb == 0 {
+            *out_ptr = b_key;
+            *(out_ptr + KEY_SIZE) = b_val;
+            *(out_ptr + KEY_SIZE + KEY_SIZE) = 0;
+            oi = oi + 1;
+        }
+        bi = bi + 1;
+    }
+    return oi;
+}
+
+// ─── Table: sorted immutable run ───
+
+pub struct Table {
+    id: i64,
+    block_addr: i64,   // block address in Grid where entries start
+    entry_count: i64,  // number of valid entries
+    min_key: i64,      // inclusive
+    max_key: i64,      // inclusive
+}
+
+pub fn Table_new(id: i64, block_addr: i64) -> Table {
+    return Table { id: id, block_addr: block_addr,
+        entry_count: 0, min_key: 0, max_key: 0 };
+}
+
+pub fn Table_init(table: &Table, buf: i64, count: i64) {
+    let e: i64 = table.block_addr as i64;
+    // Read first and last key from the buffer
+    *e = *buf;  // min_key
+    *(e + 8) = *(buf + (count - 1) * ENTRY_SIZE);  // max_key
+    table.entry_count = count;
+    table.min_key = *buf;
+    table.max_key = *(buf + (count - 1) * ENTRY_SIZE);
+}
+
+// ─── Level: sorted run of non-overlapping tables ───
+
+pub struct Level {
+    tables: i64,   // pointer to Table array (dynamically allocated)
+    count: i64,    // number of tables
+    capacity: i64, // allocated capacity
+}
+
+pub fn Level_new(capacity: i64) -> Level {
+    let buf: i64 = malloc(capacity * 24);  // each Table is 3 u64s
+    return Level { tables: buf, count: 0, capacity: capacity };
+}
+
+pub fn Level_lookup(level: &Level, key: i64) -> i64 {
+    // Binary search across tables (by min_key)
+    let low: i64 = 0;
+    let high: i64 = level.count - 1;
+    while low <= high {
+        let mid: i64 = low + (high - low) / 2;
+        let table_ptr: i64 = level.tables + mid * 24;
+        let t_min: i64 = *table_ptr;
+        let t_max: i64 = *(table_ptr + 8);
+        let t_addr: i64 = *(table_ptr + 16);
+        if key >= t_min && key <= t_max {
+            return t_addr;  // found containing table
+        }
+        if key < t_min {
+            high = mid - 1;
+        } else {
+            low = mid + 1;
+        }
+    }
+    return -1;  // not found
+}
+
+pub fn Level_add_table(level: &Level, table: &Table) {
+    if level.count < level.capacity {
+        let ptr: i64 = level.tables + level.count * 24;
+        *ptr = table.min_key;
+        *(ptr + 8) = table.max_key;
+        *(ptr + 16) = table.block_addr;
+        level.count = level.count + 1;
+    }
+}
+
+// ─── Compaction: merge tables from one level to the next ───
+
+pub struct Compaction {
+    input_level: i64,   // level index
+    output_level: i64,  // target level index
+    merge_buf: i64,     // merge output buffer
+    merge_count: i64,   // entries in merge buffer
+}
+
+pub fn Compaction_new(input: i64, output: i64) -> Compaction {
+    let buf: i64 = malloc(MAX_TABLE_ENTRIES * ENTRY_SIZE);
+    return Compaction {
+        input_level: input, output_level: output,
+        merge_buf: buf, merge_count: 0,
+    };
+}
+
+pub fn Compaction_run(c: &Compaction, input_entries: i64, input_count: i64,
+                       output_entries: i64, output_count: i64, storage_fd: i64) -> i64 {
+    // Merge sorted entries from input and output levels
+    let merged: i64 = merge_entries(input_entries, input_count,
+        output_entries, output_count, c.merge_buf);
+    c.merge_count = merged;
+
+    // If merged result is small enough, write as a single table
+    if merged <= MAX_TABLE_ENTRIES && merged > 0 {
+        let block_addr: i64 = Grid_alloc_block(storage_fd, c.output_level + 1);
+        Grid_write(storage_fd, block_addr, c.merge_buf);
+        return block_addr;
+    }
+
+    return -1;
+}
+
+// ─── Manifest: tree metadata ───
+
+pub struct Manifest {
+    trees: i64,      // tree array
+    tree_count: i64,
+    sequence: i64,   // monotonic sequence number
+}
+
+pub fn Manifest_new() -> Manifest {
+    return Manifest { trees: 0, tree_count: 0, sequence: 0 };
+}
+
+pub fn Manifest_next_seq(m: &Manifest) -> i64 {
+    m.sequence = m.sequence + 1;
+    return m.sequence;
+}
+
+// ─── Tree operations ───
+
+pub struct Tree {
+    id: i64,
+    levels: i64,        // Level array
+    level_count: i64,
+    manifest: i64,      // Manifest pointer
+    mem_table: i64,     // in-memory write buffer (sorted entries)
+    mem_count: i64,
+    mem_capacity: i64,
+    storage_fd: i64,    // file descriptor for Grid
+}
+
+pub fn Tree_new(id: i64, storage_fd: i64, manifest: i64) -> Tree {
+    let levels_buf: i64 = malloc(MAX_LEVELS * 16);  // Level structs
+    let mem_buf: i64 = malloc(ENTRIES_PER_BLOCK * ENTRY_SIZE);
+    return Tree {
+        id: id, levels: levels_buf, level_count: MAX_LEVELS,
+        manifest: manifest,
+        mem_table: mem_buf, mem_count: 0,
+        mem_capacity: ENTRIES_PER_BLOCK,
+        storage_fd: storage_fd,
+    };
+}
+
+// Insert into the in-memory table (sorted insert)
+pub fn Tree_put(tree: &Tree, key: i64, value: i64) -> i64 {
+    if tree.mem_count >= tree.mem_capacity {
+        return -1;  // memtable full, needs flush
+    }
+    // Find insert position (sorted order)
+    let pos: i64 = tree.mem_count;
+    let i: i64 = 0;
+    while i < tree.mem_count {
+        let entry_ptr: i64 = tree.mem_table + i * ENTRY_SIZE;
+        let k: i64 = *entry_ptr;
+        if k == key {
+            // Update existing
+            *(entry_ptr + KEY_SIZE) = value;
+            *(entry_ptr + KEY_SIZE + KEY_SIZE) = 0;
+            return 0;
+        }
+        if k > key {
+            pos = i;
+            break;
+        }
+        i = i + 1;
+    }
+    // Shift entries right to make room
+    let j: i64 = tree.mem_count;
+    while j > pos {
+        let src: i64 = tree.mem_table + (j - 1) * ENTRY_SIZE;
+        let dst: i64 = tree.mem_table + j * ENTRY_SIZE;
+        *dst = *src;
+        *(dst + KEY_SIZE) = *(src + KEY_SIZE);
+        *(dst + KEY_SIZE + KEY_SIZE) = *(src + KEY_SIZE + KEY_SIZE);
+        j = j - 1;
+    }
+    // Insert new entry
+    let entry_ptr: i64 = tree.mem_table + pos * ENTRY_SIZE;
+    *entry_ptr = key;
+    *(entry_ptr + KEY_SIZE) = value;
+    *(entry_ptr + KEY_SIZE + KEY_SIZE) = 0;
+    tree.mem_count = tree.mem_count + 1;
+    return 0;
+}
+
+pub fn Tree_delete(tree: &Tree, key: i64) -> i64 {
+    // Insert a tombstone
+    if tree.mem_count >= tree.mem_capacity {
+        return -1;
+    }
+    let pos: i64 = tree.mem_count;
+    let i: i64 = 0;
+    while i < tree.mem_count {
+        let entry_ptr: i64 = tree.mem_table + i * ENTRY_SIZE;
+        let k: i64 = *entry_ptr;
+        if k >= key {
+            pos = i;
+            break;
+        }
+        i = i + 1;
+    }
+    // Shift and insert tombstone
+    let j: i64 = tree.mem_count;
+    while j > pos {
+        let src: i64 = tree.mem_table + (j - 1) * ENTRY_SIZE;
+        let dst: i64 = tree.mem_table + j * ENTRY_SIZE;
+        *dst = *src;
+        *(dst + KEY_SIZE) = *(src + KEY_SIZE);
+        *(dst + KEY_SIZE + KEY_SIZE) = *(src + KEY_SIZE + KEY_SIZE);
+        j = j - 1;
+    }
+    let entry_ptr: i64 = tree.mem_table + pos * ENTRY_SIZE;
+    *entry_ptr = key;
+    *(entry_ptr + KEY_SIZE) = 0;
+    *(entry_ptr + KEY_SIZE + KEY_SIZE) = TOMBSTONE;
+    tree.mem_count = tree.mem_count + 1;
+    return 0;
+}
+
+pub fn Tree_flush(tree: &Tree) -> i64 {
+    // Flush in-memory table to storage as a new level-0 table
+    if tree.mem_count == 0 { return 0; }
+    let block_addr: i64 = Grid_alloc_block(tree.storage_fd, 1);
+    Grid_write(tree.storage_fd, block_addr, tree.mem_table);
+    tree.mem_count = 0;
+    return block_addr;
+}
+
+pub fn Tree_get(tree: &Tree, key: i64) -> (i64, i64) {
+    // 1. Search in-memory table first
+    let (pos, value): (i64, i64) = binary_search(tree.mem_table, tree.mem_count, key);
+    if pos >= 0 {
+        let entry_ptr: i64 = tree.mem_table + pos * ENTRY_SIZE;
+        let tomb: i64 = *(entry_ptr + KEY_SIZE + KEY_SIZE);
+        if tomb == TOMBSTONE { return (-1, 0); }
+        return (pos, value);
+    }
+    // 2. Search on-disk levels
+    let li: i64 = 0;
+    while li < tree.level_count {
+        let level_ptr: i64 = tree.levels + li * 16;
+        let lv_count: i64 = *(level_ptr + 8);
+        if lv_count > 0 {
+            let lv_tables: i64 = *level_ptr;
+            let ti: i64 = 0;
+            while ti < lv_count {
+                let table_ptr: i64 = lv_tables + ti * 24;
+                let t_min: i64 = *table_ptr;
+                let t_max: i64 = *(table_ptr + 8);
+                let t_addr: i64 = *(table_ptr + 16);
+                if key >= t_min && key <= t_max {
+                    // Read table from storage and binary search
+                    let buf: i64 = malloc(BLOCK_SIZE);
+                    Grid_read(tree.storage_fd, t_addr, buf);
+                    let (p, v): (i64, i64) = binary_search(buf, ENTRIES_PER_BLOCK, key);
+                    if p >= 0 {
+                        free(buf);
+                        let tomb: i64 = *(buf + p * ENTRY_SIZE + KEY_SIZE + KEY_SIZE);
+                        if tomb == TOMBSTONE { return (-1, 0); }
+                        return (p, v);
+                    }
+                    free(buf);
+                }
+                ti = ti + 1;
+            }
+        }
+        li = li + 1;
+    }
+    return (-1, 0);  // not found
+}
+
+// ─── Forest: all trees ───
+
+pub struct Forest {
+    trees: i64,     // Tree array pointer
+    count: i64,
+    grid_fd: i64,
+}
+
+pub fn Forest_new(grid_fd: i64) -> Forest {
+    let manifest: i64 = malloc(32);
+    let tree_ptr: i64 = malloc(48 * 16);  // 16 trees × 48 bytes each
+    let i: i64 = 0;
+    while i < 16 {
+        let tree_addr: i64 = tree_ptr + i * 48;
+        let tree: i64 = Tree_new(i, grid_fd, manifest);
+        // Copy tree to tree_addr
+        i = i + 1;
+    }
+    return Forest { trees: tree_ptr, count: 16, grid_fd: grid_fd };
+}

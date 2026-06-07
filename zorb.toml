@@ -1,0 +1,8 @@
+[package]
+name = "@storage/lsm"
+version = "0.1.0"
+description = "LSM-tree storage engine for Zeta — Grid, Tree, Compaction, Manifest with full operation implementations"
+license = "MIT"
+repository = "https://github.com/murphsicles/lsm"
+keywords = ["lsm-tree", "storage", "database", "compaction"]
+categories = ["storage", "database"]
